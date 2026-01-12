@@ -23,10 +23,14 @@ wheels/
 .installed.cfg
 *.egg
 
+# Environment variables
 .env
-.venv
 .env.local
+.env*.local
+.venv
+ENV/
 
+# IDE
 .vscode/
 .idea/
 *.swp
@@ -37,11 +41,18 @@ wheels/
 .coverage
 htmlcov/
 .tox/
+.hypothesis/
+.mypy_cache/
+.ruff_cache/
 
+# Databases
 *.db
 *.sqlite
 
 *.log
 
-.DS_Store
+# Python version management
+.python-version
+
+# OS
 Thumbs.db
