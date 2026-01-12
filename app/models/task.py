@@ -89,8 +89,8 @@ class Tag(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String(50), unique=True, nullable=False, index=True)
     
-    # Relationships
-    tasks = relationship("Tag", secondary=task_tags, back_populates="tags")
+    # Relationships - FIXED: Changed from "Tag" to "Task"
+    tasks = relationship("Task", secondary=task_tags, back_populates="tags")
 
 class TaskHistory(Base):
     __tablename__ = "task_history"

@@ -14,6 +14,7 @@ class TaskService:
         self.redis = get_redis()
     
     def create_task(self, task_data: TaskCreate, creator_id: int) -> Task:
+        """Create a new task with assignees, tags, and dependencies"""
         # Create task
         task = Task(
             title=task_data.title,
@@ -38,6 +39,7 @@ class TaskService:
             if not tag:
                 tag = Tag(name=tag_name)
                 self.db.add(tag)
+                self.db.flush()
             task.tags.append(tag)
         
         # Add dependencies
@@ -54,13 +56,7 @@ class TaskService:
         return task
     
     def get_task(self, task_id: int) -> Optional[Task]:
-        # Try cache first
-        cache_key = f"task:{task_id}"
-        cached = self.redis.get(cache_key)
-        
-        if cached:
-            return json.loads(cached)
-        
+        """Get a task by ID with all relationships loaded"""
         task = (
             self.db.query(Task)
             .options(
@@ -74,13 +70,23 @@ class TaskService:
             .first()
         )
         
-        if task:
-            # Cache for 5 minutes
-            self.redis.setex(cache_key, 300, json.dumps(task, default=str))
-        
         return task
     
+    def get_all_tasks(self, skip: int = 0, limit: int = 100) -> List[Task]:
+        """Get all tasks with pagination"""
+        return (
+            self.db.query(Task)
+            .options(
+                joinedload(Task.assignees).joinedload(TaskAssignment.assignee),
+                joinedload(Task.tags)
+            )
+            .offset(skip)
+            .limit(limit)
+            .all()
+        )
+    
     def update_task(self, task_id: int, task_data: TaskUpdate, user_id: int) -> Optional[Task]:
+        """Update a task and track changes in history"""
         task = self.db.query(Task).filter(Task.id == task_id).first()
         if not task:
             return None
@@ -88,23 +94,35 @@ class TaskService:
         # Track changes for history
         changes = []
         
-        for field, value in task_data.dict(exclude_unset=True).items():
-            if field == "assignee_ids" and value is not None:
-                # Update assignees
-                self.db.query(TaskAssignment).filter(TaskAssignment.task_id == task_id).delete()
-                for assignee_id in value:
-                    assignment = TaskAssignment(task_id=task_id, user_id=assignee_id)
-                    self.db.add(assignment)
-            elif field == "tag_names" and value is not None:
-                # Update tags
-                task.tags.clear()
-                for tag_name in value:
-                    tag = self.db.query(Tag).filter(Tag.name == tag_name).first()
-                    if not tag:
-                        tag = Tag(name=tag_name)
-                        self.db.add(tag)
-                    task.tags.append(tag)
-            else:
+        update_dict = task_data.dict(exclude_unset=True)
+        
+        # Handle assignees separately
+        if "assignee_ids" in update_dict and update_dict["assignee_ids"] is not None:
+            # Update assignees
+            self.db.query(TaskAssignment).filter(TaskAssignment.task_id == task_id).delete()
+            for assignee_id in update_dict["assignee_ids"]:
+                assignment = TaskAssignment(task_id=task_id, user_id=assignee_id)
+                self.db.add(assignment)
+            changes.append(("assignees", "", ",".join(map(str, update_dict["assignee_ids"]))))
+            del update_dict["assignee_ids"]
+        
+        # Handle tags separately
+        if "tag_names" in update_dict and update_dict["tag_names"] is not None:
+            # Update tags
+            task.tags.clear()
+            for tag_name in update_dict["tag_names"]:
+                tag = self.db.query(Tag).filter(Tag.name == tag_name).first()
+                if not tag:
+                    tag = Tag(name=tag_name)
+                    self.db.add(tag)
+                    self.db.flush()
+                task.tags.append(tag)
+            changes.append(("tags", "", ",".join(update_dict["tag_names"])))
+            del update_dict["tag_names"]
+        
+        # Update regular fields
+        for field, value in update_dict.items():
+            if hasattr(task, field):
                 old_value = getattr(task, field)
                 if old_value != value:
                     changes.append((field, str(old_value), str(value)))
@@ -126,11 +144,25 @@ class TaskService:
         
         # Invalidate cache
         self._invalidate_task_cache()
-        self.redis.delete(f"task:{task_id}")
         
         return task
     
+    def delete_task(self, task_id: int) -> bool:
+        """Delete a task"""
+        task = self.db.query(Task).filter(Task.id == task_id).first()
+        if not task:
+            return False
+        
+        self.db.delete(task)
+        self.db.commit()
+        
+        # Invalidate cache
+        self._invalidate_task_cache()
+        
+        return True
+    
     def bulk_update_tasks(self, bulk_data: TaskBulkUpdate, user_id: int) -> int:
+        """Update multiple tasks at once"""
         tasks = self.db.query(Task).filter(Task.id.in_(bulk_data.task_ids)).all()
         
         updated_count = 0
@@ -172,6 +204,7 @@ class TaskService:
         return updated_count
     
     def filter_tasks(self, filters: TaskFilterRequest, user_id: int) -> List[Task]:
+        """Filter tasks with complex AND/OR logic"""
         query = self.db.query(Task).options(
             joinedload(Task.assignees).joinedload(TaskAssignment.assignee),
             joinedload(Task.tags)
@@ -209,12 +242,15 @@ class TaskService:
         return query.distinct().all()
     
     def get_analytics(self) -> dict:
+        """Get analytics dashboard data"""
         # Try cache first
         cache_key = "analytics:dashboard"
-        cached = self.redis.get(cache_key)
-        
-        if cached:
-            return json.loads(cached)
+        try:
+            cached = self.redis.get(cache_key)
+            if cached:
+                return json.loads(cached)
+        except Exception:
+            pass  # Continue if Redis fails
         
         total_tasks = self.db.query(func.count(Task.id)).scalar()
         
@@ -224,7 +260,7 @@ class TaskService:
             .group_by(Task.status)
             .all()
         )
-        tasks_by_status = {str(status): count for status, count in status_counts}
+        tasks_by_status = {str(status.value): count for status, count in status_counts}
         
         # Tasks by priority
         priority_counts = (
@@ -232,7 +268,7 @@ class TaskService:
             .group_by(Task.priority)
             .all()
         )
-        tasks_by_priority = {str(priority): count for priority, count in priority_counts}
+        tasks_by_priority = {str(priority.value): count for priority, count in priority_counts}
         
         # Overdue tasks
         overdue = (
@@ -247,15 +283,16 @@ class TaskService:
                 User.username,
                 User.email,
                 func.count(TaskAssignment.id).label("task_count"),
-                func.count(
+                func.sum(
                     func.case(
-                        (and_(Task.due_date < datetime.utcnow(), Task.status != TaskStatus.DONE), 1)
+                        (and_(Task.due_date < datetime.utcnow(), Task.status != TaskStatus.DONE), 1),
+                        else_=0
                     )
                 ).label("overdue_count")
             )
             .join(TaskAssignment, User.id == TaskAssignment.user_id)
             .join(Task, TaskAssignment.task_id == Task.id)
-            .group_by(User.id)
+            .group_by(User.id, User.username, User.email)
             .all()
         )
         
@@ -264,7 +301,7 @@ class TaskService:
                 "username": username,
                 "email": email,
                 "total_tasks": task_count,
-                "overdue_tasks": overdue_count
+                "overdue_tasks": int(overdue_count or 0)
             }
             for username, email, task_count, overdue_count in user_distribution
         ]
@@ -278,11 +315,15 @@ class TaskService:
         }
         
         # Cache for 2 minutes
-        self.redis.setex(cache_key, 120, json.dumps(result))
+        try:
+            self.redis.setex(cache_key, 120, json.dumps(result))
+        except Exception:
+            pass  # Continue if Redis fails
         
         return result
     
     def get_user_timeline(self, user_id: int, days: int = 7) -> List[TaskHistory]:
+        """Get timeline of task changes for a user"""
         from_date = datetime.utcnow() - timedelta(days=days)
         
         # Get tasks assigned to user
@@ -308,4 +349,7 @@ class TaskService:
     
     def _invalidate_task_cache(self):
         """Invalidate all task-related caches"""
-        self.redis.delete("analytics:dashboard")
+        try:
+            self.redis.delete("analytics:dashboard")
+        except Exception:
+            pass  # Continue if Redis fails
